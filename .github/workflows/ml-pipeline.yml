@@ -1,0 +1,181 @@
+name: ml-pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Кількість епох навчання"
+        default: "10"
+      push_image:
+        description: "Опублікувати образ у GHCR"
+        type: boolean
+        default: false
+
+# Новий коміт у тій самій гілці скасовує попередній запуск
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # PR: коротке навчання; main: повне; ручний запуск: значення з UI
+  EPOCHS: ${{ inputs.epochs || (github.event_name == 'pull_request' && '3' || '10') }}
+  MIN_ACCURACY: ${{ github.event_name == 'pull_request' && '70' || '85' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ruff
+        run: |
+          pip install ruff
+          ruff check --select E,F --line-length 100 src/ scripts/
+
+  train:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Cache dataset
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: speech-commands-v0.02
+
+      - name: Build trainer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: trainer
+          load: true
+          tags: kws-trainer:ci
+          cache-from: type=gha,scope=trainer
+          cache-to: type=gha,mode=max,scope=trainer
+
+      - name: Train in container
+        run: |
+          set -o pipefail
+          mkdir -p artifacts data
+          docker run --rm \
+            -v "$PWD/artifacts:/artifacts" -v "$PWD/data:/data" \
+            kws-trainer:ci \
+            --classes yes no up down --epochs "$EPOCHS" --seed 42 \
+            --data-dir /data --out /artifacts 2>&1 | tee artifacts/train.log
+
+      - name: Upload model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: error
+
+  verify:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: artifacts/
+
+      - name: Build runtime image
+        run: docker build --target runtime -t kws-api:ci .
+
+      - name: Start service
+        run: |
+          docker run -d --name kws -p 8000:8000 kws-api:ci
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health > /dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Golden-sample check
+        run: |
+          pip install requests
+          python scripts/verify_model.py --url http://localhost:8000 \
+            --expected samples/expected.json --out metrics/verify.json
+
+      - name: Quality gate (accuracy)
+        run: |
+          curl -sf http://localhost:8000/model-info | tee metrics/model-info.json
+          echo "threshold=$MIN_ACCURACY"
+          jq -e ".accuracy >= $MIN_ACCURACY" metrics/model-info.json
+
+      - name: Latency benchmark
+        run: |
+          pip install numpy requests
+          python scripts/benchmark.py --url http://localhost:8000 \
+            --n 100 --warmup 10 --out metrics/latency.json
+
+      - name: Report
+        if: always()
+        run: |
+          mkdir -p metrics
+          docker logs kws > metrics/service.log 2>&1 || true
+          python scripts/make_report.py --metrics metrics/ \
+            --out metrics/report.md
+          cat metrics/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: metrics/
+
+  build-push:
+    needs: verify
+    if: github.event_name == 'push' || inputs.push_image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: artifacts/
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/kws-api
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime

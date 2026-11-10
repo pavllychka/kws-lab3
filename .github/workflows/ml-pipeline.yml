@@ -26,7 +26,7 @@ permissions:
 env:
   # PR: коротке навчання; main: повне; ручний запуск: значення з UI
   EPOCHS: ${{ inputs.epochs || (github.event_name == 'pull_request' && '3' || '10') }}
-  MIN_ACCURACY: ${{ github.event_name == 'pull_request' && '70' || '85' }}
+  MIN_ACCURACY: ${{ github.event_name == 'pull_request' && '99' || '85' }}
 
 jobs:
   lint:
